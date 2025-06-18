@@ -7,10 +7,11 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
-  origin: ["http://localhost:5173", "http://192.168.88.147:5173"],
-  methods: ["GET", "POST"]
-}
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
 });
+
 
 
 app.use(cors());
