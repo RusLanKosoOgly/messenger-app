@@ -10,6 +10,9 @@ function App() {
   const [userList, setUserList] = useState([]);
   const [isRegistered, setIsRegistered] = useState(false);
   const [localStream, setLocalStream] = useState(null);
+  const [incomingCall, setIncomingCall] = useState(null);
+  const [callActive, setCallActive] = useState(false);
+
   const peerConnection = useRef(null);
   const remoteAudioRef = useRef(null);
 
@@ -25,37 +28,31 @@ function App() {
       setUserList(list.filter((name) => name !== username));
     };
 
-    socket.on("incoming-call", async ({ from, offer }) => {
-      console.log(`📲 Входящий звонок от ${from}`);
-      setTarget(from);
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      setLocalStream(stream);
-
-      const pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-      });
-
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-      pc.ontrack = (event) => {
-        const [remoteStream] = event.streams;
-        if (remoteAudioRef.current && remoteStream) {
-          remoteAudioRef.current.srcObject = remoteStream;
-        }
-      };
-
-      peerConnection.current = pc;
-
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
-      socket.emit("answer-call", { target: from, answer });
+    socket.on("incoming-call", ({ from, offer }) => {
+      setIncomingCall({ from, offer });
     });
 
     socket.on("call-answered", async ({ answer }) => {
-      console.log("📞 Звонок принят");
       await peerConnection.current.setRemoteDescription(new RTCSessionDescription(answer));
+      setCallActive(true);
+    });
+
+    socket.on("call-rejected", () => {
+      alert("❌ Пользователь отклонил вызов");
+      cleanupCall();
+    });
+
+    socket.on("call-ended", () => {
+      alert("📴 Вызов завершён другим пользователем");
+      cleanupCall();
+    });
+
+    socket.on("ice-candidate", async ({ candidate }) => {
+      try {
+        await peerConnection.current?.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.error("Ошибка при добавлении ICE-кандидата", e);
+      }
     });
 
     socket.on("receiveMessage", handleReceive);
@@ -66,43 +63,93 @@ function App() {
       socket.off("userList", handleUserList);
       socket.off("incoming-call");
       socket.off("call-answered");
+      socket.off("call-rejected");
+      socket.off("call-ended");
+      socket.off("ice-candidate");
     };
   }, [username]);
+
+  const createPeerConnection = (targetUser, stream) => {
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
+
+    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+    pc.ontrack = (event) => {
+      const [remoteStream] = event.streams;
+      if (remoteAudioRef.current && remoteStream) {
+        remoteAudioRef.current.srcObject = remoteStream;
+      }
+    };
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit("ice-candidate", { target: targetUser, candidate: event.candidate });
+      }
+    };
+
+    return pc;
+  };
+
+  const handleAcceptCall = async () => {
+    const { from, offer } = incomingCall;
+    setIncomingCall(null);
+    setTarget(from);
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    setLocalStream(stream);
+
+    const pc = createPeerConnection(from, stream);
+    peerConnection.current = pc;
+
+    await pc.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    socket.emit("answer-call", { target: from, answer });
+    setCallActive(true);
+  };
+
+  const handleRejectCall = () => {
+    socket.emit("reject-call", { target: incomingCall.from });
+    setIncomingCall(null);
+  };
+
+  const handleEndCall = () => {
+    socket.emit("end-call", { target });
+    cleanupCall();
+  };
+
+  const cleanupCall = () => {
+    if (peerConnection.current) {
+      peerConnection.current.close();
+      peerConnection.current = null;
+    }
+    if (localStream) {
+      localStream.getTracks().forEach((track) => track.stop());
+      setLocalStream(null);
+    }
+    setCallActive(false);
+  };
 
   const handleCall = async () => {
     if (!target) return;
 
-    console.log(`📞 Вызываем ${target}...`);
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      setLocalStream(stream);
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    setLocalStream(stream);
 
-      const pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-      });
+    const pc = createPeerConnection(target, stream);
+    peerConnection.current = pc;
 
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-      pc.ontrack = (event) => {
-        const [remoteStream] = event.streams;
-        if (remoteAudioRef.current && remoteStream) {
-          remoteAudioRef.current.srcObject = remoteStream;
-        }
-      };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
 
-      peerConnection.current = pc;
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      socket.emit("call-user", { target, offer, from: username });
-    } catch (err) {
-      console.error("❌ Ошибка при доступе к микрофону", err);
-    }
+    socket.emit("call-user", { target, offer, from: username });
   };
 
   const handleRegister = () => {
     if (username.trim()) {
-      console.log("📨 Регистрируем пользователя:", username); // <-- проверь что выводит
       socket.emit("register", username);
       setIsRegistered(true);
     }
@@ -129,6 +176,16 @@ function App() {
     );
   }
 
+  if (incomingCall) {
+    return (
+      <div className="incoming-call">
+        <h3>📞 Входящий звонок от: {incomingCall.from}</h3>
+        <button onClick={handleAcceptCall}>✅ Принять</button>
+        <button onClick={handleRejectCall}>❌ Отклонить</button>
+      </div>
+    );
+  }
+
   return (
     <div className="messenger">
       <div className="sidebar">
@@ -143,9 +200,16 @@ function App() {
       <div className="chat">
         <h3>Чат с: {target || "..."}</h3>
         {target && (
-          <button onClick={handleCall} style={{ marginBottom: "12px" }}>
-            📞 Позвонить
-          </button>
+          <>
+            <button onClick={handleCall} style={{ marginBottom: "12px" }}>
+              📞 Позвонить
+            </button>
+            {callActive && (
+              <button onClick={handleEndCall} style={{ marginLeft: "8px" }}>
+                🔴 Завершить
+              </button>
+            )}
+          </>
         )}
         <div className="form-group">
           <input placeholder="Сообщение" value={message} onChange={(e) => setMessage(e.target.value)} />
